@@ -1,0 +1,15 @@
+{
+  "batch_size": 128,
+  "device": "cpu",
+  "epochs": 300,
+  "lr": 0.001,
+  "min_neurons": 16,
+  "mode": "fixed",
+  "n_test": 1000,
+  "n_train": 5000,
+  "noise": 0.0,
+  "prune_fraction": 0.1,
+  "seed": 0,
+  "task": "simple",
+  "update_interval": 20
+}

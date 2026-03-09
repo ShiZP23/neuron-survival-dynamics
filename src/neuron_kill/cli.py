@@ -1,0 +1,95 @@
+import argparse
+import os
+
+from neuron_kill.data import TASKS
+from neuron_kill.aggregate import summarize_results, write_summary_csv, plot_summary
+from neuron_kill.plots import plot_losses, plot_param_count, plot_sizes, plot_surface
+from neuron_kill.train import train_one_run
+from neuron_kill.utils import get_device, make_run_dir, save_json, set_seed
+
+MODES = ["fixed", "prune_only", "prune_grow_random", "prune_grow_split"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Neuron prune/regrow toy experiment")
+    parser.add_argument("--task", choices=TASKS, default="medium")
+    parser.add_argument("--mode", choices=MODES, default="fixed")
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--update-interval", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--prune-fraction", type=float, default=0.1)
+    parser.add_argument("--min-neurons", type=int, default=16)
+    parser.add_argument("--n-train", type=int, default=5000)
+    parser.add_argument("--n-test", type=int, default=1000)
+    parser.add_argument("--noise", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--all", action="store_true", help="run all tasks and modes")
+    return parser.parse_args()
+
+
+def run_single(args: argparse.Namespace, task: str, mode: str, seed: int) -> None:
+    set_seed(seed)
+    device = get_device(args.device)
+    run_dir = make_run_dir(args.results_dir, task, mode, seed)
+
+    config = {
+        "task": task,
+        "mode": mode,
+        "epochs": args.epochs,
+        "update_interval": args.update_interval,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "prune_fraction": args.prune_fraction,
+        "min_neurons": args.min_neurons,
+        "n_train": args.n_train,
+        "n_test": args.n_test,
+        "noise": args.noise,
+        "seed": seed,
+        "device": str(device),
+    }
+    save_json(os.path.join(run_dir, "config.json"), config)
+
+    model, history = train_one_run(
+        task=task,
+        mode=mode,
+        run_dir=run_dir,
+        seed=seed,
+        device=device,
+        epochs=args.epochs,
+        update_interval=args.update_interval,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        prune_fraction=args.prune_fraction,
+        min_neurons=args.min_neurons,
+        n_train=args.n_train,
+        n_test=args.n_test,
+        noise=args.noise,
+    )
+
+    plot_losses(history, os.path.join(run_dir, "loss.png"))
+    plot_sizes(history, os.path.join(run_dir, "sizes.png"))
+    plot_param_count(history, os.path.join(run_dir, "params.png"))
+    plot_surface(model, task, os.path.join(run_dir, "surface.png"), device)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.all:
+        for idx, task in enumerate(TASKS):
+            for jdx, mode in enumerate(MODES):
+                run_single(args, task, mode, args.seed)
+        records = summarize_results(args.results_dir)
+        if records:
+            write_summary_csv(records, os.path.join(args.results_dir, "summary.csv"))
+            plot_summary(records, os.path.join(args.results_dir, "summary.png"))
+        return
+
+    run_single(args, args.task, args.mode, args.seed)
+
+
+if __name__ == "__main__":
+    main()
