@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
-from neuron_kill.data import TASKS
+from neuron_survival_dynamics.data import TASKS
 
 
 def _parse_run_path(results_dir: str, metrics_path: str) -> Optional[Tuple[str, str, int, str]]:
@@ -148,7 +148,7 @@ def plot_summary(records: List[Dict], path: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Aggregate neuron_kill results")
+    parser = argparse.ArgumentParser(description="Aggregate neuron_survival_dynamics results")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--out-csv", type=str, default=None)
     parser.add_argument("--out-plot", type=str, default=None)

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from neuron_kill.model import MLP
+from neuron_survival_dynamics.model import MLP
 
 
 def compute_importance(

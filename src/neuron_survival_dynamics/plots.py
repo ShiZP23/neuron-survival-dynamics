@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from neuron_kill.data import evaluate_target, make_grid
-from neuron_kill.model import MLP
+from neuron_survival_dynamics.data import evaluate_target, make_grid
+from neuron_survival_dynamics.model import MLP
 
 
 def plot_losses(history: List[Dict], path: str) -> None:

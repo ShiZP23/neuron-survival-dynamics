@@ -7,10 +7,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from neuron_kill.data import DatasetBundle, make_dataset
-from neuron_kill.model import MLP
-from neuron_kill.structural import compute_importance, prune_and_grow
-from neuron_kill.utils import count_trainable_params
+from neuron_survival_dynamics.data import DatasetBundle, make_dataset
+from neuron_survival_dynamics.model import MLP
+from neuron_survival_dynamics.structural import compute_importance, prune_and_grow
+from neuron_survival_dynamics.utils import count_trainable_params
 
 
 def _run_epoch(

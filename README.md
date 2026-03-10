@@ -1,10 +1,17 @@
-# Neuron Kill: Survival-Based Prune + Regrow
+# Neuron Survival Dynamics: Survival-Based Prune + Regrow
 
 ## Project overview
 
 This project is a small, research-oriented PyTorch experiment that explores whether a dense MLP can self-organize into a more efficient architecture when we periodically prune weak neurons and regrow new ones during training.
 
 The focus is on interpretability, structural evolution, and reproducibility rather than production performance.
+
+## Repository structure
+
+- `run.py`: entrypoint script
+- `src/neuron_survival_dynamics/`: package source
+- `requirements.txt`: Python dependencies
+- `results/`: generated experiment outputs (git-ignored)
 
 ## Experiment goal
 
@@ -81,10 +88,10 @@ python run.py --all
 Aggregate existing results manually:
 
 ```bash
-PYTHONPATH=src python -m neuron_kill.aggregate --results-dir results
+PYTHONPATH=src python -m neuron_survival_dynamics.aggregate --results-dir results
 ```
 
-## New CLI arguments
+## Key CLI arguments
 
 - `--ema-beta`: EMA decay factor
 - `--ema-z-threshold`: z-score threshold for low-EMA candidates

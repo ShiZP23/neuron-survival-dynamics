@@ -1,11 +1,11 @@
 import argparse
 import os
 
-from neuron_kill.data import TASKS
-from neuron_kill.aggregate import summarize_results, write_summary_csv, plot_summary
-from neuron_kill.plots import plot_losses, plot_param_count, plot_sizes, plot_surface
-from neuron_kill.train import train_one_run
-from neuron_kill.utils import get_device, make_run_dir, save_json, set_seed
+from neuron_survival_dynamics.data import TASKS
+from neuron_survival_dynamics.aggregate import summarize_results, write_summary_csv, plot_summary
+from neuron_survival_dynamics.plots import plot_losses, plot_param_count, plot_sizes, plot_surface
+from neuron_survival_dynamics.train import train_one_run
+from neuron_survival_dynamics.utils import get_device, make_run_dir, save_json, set_seed
 
 MODES = ["fixed", "prune_only", "prune_grow_random", "prune_grow_split"]
 
