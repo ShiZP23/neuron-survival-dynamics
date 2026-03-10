@@ -1,4 +1,4 @@
-from typing import List, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -8,7 +8,7 @@ class MLP(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        hidden_sizes: Sequence[int] = (64, 64, 64),
+        hidden_sizes: Sequence[int] = (128, 128, 128),
         output_dim: int = 1,
     ) -> None:
         super().__init__()
@@ -20,11 +20,19 @@ class MLP(nn.Module):
         self.out = nn.Linear(prev, output_dim)
         self.activation = nn.ReLU()
 
-    def forward(self, x: torch.Tensor, return_activations: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_activations: bool = False,
+        ablate: Optional[Tuple[int, int]] = None,
+    ):
         activations = []
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             x = layer(x)
             x = self.activation(x)
+            if ablate is not None and ablate[0] == idx:
+                x = x.clone()
+                x[:, ablate[1]] = 0.0
             if return_activations:
                 activations.append(x)
         x = self.out(x)

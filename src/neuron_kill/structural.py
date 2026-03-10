@@ -213,64 +213,65 @@ def _grow_layer_split(
 
 def prune_and_grow(
     model: MLP,
-    importances: List[torch.Tensor],
+    prune_indices: List[List[int]],
     mode: str,
-    prune_fraction: float = 0.1,
-    min_neurons: int = 16,
-    rng: Optional[np.random.Generator] = None,
-) -> Tuple[List[int], List[int]]:
-    if mode == "fixed":
-        return [0 for _ in model.hidden_sizes()], [0 for _ in model.hidden_sizes()]
-
+    importances: List[torch.Tensor],
+    rng: Optional[np.random.Generator],
+    ema_state: List[torch.Tensor],
+) -> Tuple[List[int], List[int], List[torch.Tensor]]:
     if rng is None:
         raise ValueError("rng must be provided for reproducible structural updates")
 
     sizes = model.hidden_sizes()
-    prune_counts: List[int] = []
-    keep_indices: List[torch.Tensor] = []
-    for size, importance in zip(sizes, importances):
-        max_prune = max(size - min_neurons, 0)
-        prune_count = min(int(size * prune_fraction), max_prune)
-        prune_counts.append(prune_count)
-        if prune_count == 0:
-            keep_indices.append(torch.arange(size, device=importance.device))
-            continue
-        keep_count = size - prune_count
-        topk = torch.topk(importance, k=keep_count, largest=True)
-        keep_idx = torch.sort(topk.indices).values
-        keep_indices.append(keep_idx)
-
-    for layer_idx, keep_idx in enumerate(keep_indices):
-        if keep_idx.numel() < sizes[layer_idx]:
-            _prune_layer(model, layer_idx, keep_idx)
-
-    if mode == "prune_only":
-        return prune_counts, [0 for _ in prune_counts]
-
+    pruned_counts: List[int] = []
     grown_counts: List[int] = []
-    for layer_idx, prune_count in enumerate(prune_counts):
-        if prune_count == 0:
+
+    for layer_idx, size in enumerate(sizes):
+        prune_idx = sorted(prune_indices[layer_idx])
+        if not prune_idx:
+            pruned_counts.append(0)
             grown_counts.append(0)
             continue
 
+        keep_mask = torch.ones(size, dtype=torch.bool)
+        keep_mask[prune_idx] = False
+        keep_idx_cpu = torch.arange(size)[keep_mask]
+        keep_idx_device = keep_idx_cpu.to(model.layers[layer_idx].weight.device)
+
+        _prune_layer(model, layer_idx, keep_idx_device)
+        ema_state[layer_idx] = ema_state[layer_idx][keep_idx_cpu]
+
+        pruned_counts.append(len(prune_idx))
+
+        if mode == "prune_only":
+            grown_counts.append(0)
+            continue
+
+        add_count = len(prune_idx)
         if mode == "prune_grow_random":
-            _grow_layer_random(model, layer_idx, prune_count, rng)
-            grown_counts.append(prune_count)
+            _grow_layer_random(model, layer_idx, add_count, rng)
+            new_ema = torch.zeros(add_count)
+            ema_state[layer_idx] = torch.cat([ema_state[layer_idx], new_ema])
+            grown_counts.append(add_count)
             continue
 
         if mode == "prune_grow_split":
-            keep_idx = keep_indices[layer_idx]
-            kept_importance = importances[layer_idx][keep_idx].detach().cpu().numpy()
+            kept_importance = (
+                importances[layer_idx][keep_idx_device].detach().cpu().numpy()
+            )
             if kept_importance.size == 0:
                 grown_counts.append(0)
                 continue
+            # Parent selection uses current importance among surviving neurons.
             top_k = max(1, int(0.2 * kept_importance.size))
             source_pool = np.argsort(kept_importance)[-top_k:]
-            source_indices = rng.choice(source_pool, size=prune_count, replace=True)
-            _grow_layer_split(model, layer_idx, prune_count, source_indices, rng)
-            grown_counts.append(prune_count)
+            source_indices = rng.choice(source_pool, size=add_count, replace=True)
+            _grow_layer_split(model, layer_idx, add_count, source_indices, rng)
+            parent_ema = ema_state[layer_idx][source_indices].clone()
+            ema_state[layer_idx] = torch.cat([ema_state[layer_idx], parent_ema])
+            grown_counts.append(add_count)
             continue
 
         raise ValueError(f"Unknown mode: {mode}")
 
-    return prune_counts, grown_counts
+    return pruned_counts, grown_counts, ema_state

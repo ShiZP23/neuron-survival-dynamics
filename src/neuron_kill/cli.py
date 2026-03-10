@@ -14,13 +14,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Neuron prune/regrow toy experiment")
     parser.add_argument("--task", choices=TASKS, default="medium")
     parser.add_argument("--mode", choices=MODES, default="fixed")
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=3000)
     parser.add_argument("--update-interval", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--prune-fraction", type=float, default=0.1)
     parser.add_argument("--min-neurons", type=int, default=16)
+    parser.add_argument("--ema-beta", type=float, default=0.9)
+    parser.add_argument("--ema-z-threshold", type=float, default=1.0)
+    parser.add_argument("--max-candidates-per-layer", type=int, default=8)
+    parser.add_argument("--ablation-epsilon-ratio", type=float, default=0.01)
     parser.add_argument("--n-train", type=int, default=5000)
+    parser.add_argument("--n-val", type=int, default=1000)
     parser.add_argument("--n-test", type=int, default=1000)
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -42,9 +46,13 @@ def run_single(args: argparse.Namespace, task: str, mode: str, seed: int) -> Non
         "update_interval": args.update_interval,
         "batch_size": args.batch_size,
         "lr": args.lr,
-        "prune_fraction": args.prune_fraction,
         "min_neurons": args.min_neurons,
+        "ema_beta": args.ema_beta,
+        "ema_z_threshold": args.ema_z_threshold,
+        "max_candidates_per_layer": args.max_candidates_per_layer,
+        "ablation_epsilon_ratio": args.ablation_epsilon_ratio,
         "n_train": args.n_train,
+        "n_val": args.n_val,
         "n_test": args.n_test,
         "noise": args.noise,
         "seed": seed,
@@ -62,11 +70,15 @@ def run_single(args: argparse.Namespace, task: str, mode: str, seed: int) -> Non
         update_interval=args.update_interval,
         batch_size=args.batch_size,
         lr=args.lr,
-        prune_fraction=args.prune_fraction,
         min_neurons=args.min_neurons,
         n_train=args.n_train,
+        n_val=args.n_val,
         n_test=args.n_test,
         noise=args.noise,
+        ema_beta=args.ema_beta,
+        ema_z_threshold=args.ema_z_threshold,
+        max_candidates_per_layer=args.max_candidates_per_layer,
+        ablation_epsilon_ratio=args.ablation_epsilon_ratio,
     )
 
     plot_losses(history, os.path.join(run_dir, "loss.png"))
