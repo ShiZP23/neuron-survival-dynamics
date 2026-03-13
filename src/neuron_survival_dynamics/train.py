@@ -72,6 +72,30 @@ def _ablation_loss(
     return total_loss / max(total_count, 1)
 
 
+def _count_active_neurons(
+    model: MLP,
+    loader: DataLoader,
+    device: torch.device,
+    active_threshold: float,
+) -> List[int]:
+    model.eval()
+    sizes = model.hidden_sizes()
+    sums = [torch.zeros(size, device=device) for size in sizes]
+    total = 0
+
+    with torch.no_grad():
+        for x, _ in loader:
+            x = x.to(device)
+            _, activations = model(x, return_activations=True)
+            batch = x.size(0)
+            total += batch
+            for idx, act in enumerate(activations):
+                sums[idx] += act.abs().sum(dim=0)
+
+    mean_abs = [s / max(total, 1) for s in sums]
+    return [int((m > active_threshold).sum().item()) for m in mean_abs]
+
+
 def train_one_run(
     task: str,
     mode: str,
@@ -87,23 +111,31 @@ def train_one_run(
     n_val: int = 1000,
     n_test: int = 1000,
     noise: float = 0.0,
+    data_seed: int = 0,
+    model_seed: int = 0,
+    shuffle_seed: int = 0,
+    structure_seed: int = 0,
     ema_beta: float = 0.9,
     ema_z_threshold: float = 1.0,
     max_candidates_per_layer: int = 8,
     ablation_epsilon_ratio: float = 0.01,
+    active_threshold: float = 1e-3,
 ) -> Tuple[MLP, List[Dict]]:
     data: DatasetBundle = make_dataset(
         task=task,
-        seed=seed,
+        seed=data_seed,
         n_train=n_train,
         n_val=n_val,
         n_test=n_test,
         noise=noise,
     )
+    train_gen = torch.Generator()
+    train_gen.manual_seed(shuffle_seed)
     train_loader = DataLoader(
         TensorDataset(data.x_train, data.y_train),
         batch_size=batch_size,
         shuffle=True,
+        generator=train_gen,
     )
     val_loader = DataLoader(
         TensorDataset(data.x_val, data.y_val),
@@ -115,16 +147,24 @@ def train_one_run(
         batch_size=batch_size,
         shuffle=False,
     )
+    active_loader = DataLoader(
+        TensorDataset(data.x_val, data.y_val),
+        batch_size=batch_size,
+        shuffle=False,
+    )
     importance_loader = DataLoader(
         TensorDataset(data.x_train, data.y_train),
         batch_size=batch_size,
         shuffle=False,
     )
 
-    model = MLP().to(device)
+    # Isolate model initialization RNG from the global training RNG stream.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(model_seed)
+        model = MLP().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(structure_seed)
     ema_state: Optional[List[torch.Tensor]] = None
 
     history: List[Dict] = []
@@ -208,6 +248,14 @@ def train_one_run(
 
         sizes = model.hidden_sizes()
         param_count = count_trainable_params(model)
+        active_counts = _count_active_neurons(
+            model=model,
+            loader=active_loader,
+            device=device,
+            active_threshold=active_threshold,
+        )
+        total_pruned = sum(pruned)
+        total_grown = sum(grown)
         history.append(
             {
                 "epoch": epoch,
@@ -217,6 +265,9 @@ def train_one_run(
                 "sizes": sizes,
                 "pruned": pruned,
                 "grown": grown,
+                "active_counts": active_counts,
+                "total_pruned": total_pruned,
+                "total_grown": total_grown,
                 "candidate_counts": candidate_counts,
                 "ema_means": ema_means,
                 "ema_stds": ema_stds,
@@ -226,75 +277,68 @@ def train_one_run(
 
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "metrics.csv"), "w", newline="") as f:
+        layer_count = len(history[0]["sizes"])
+        fieldnames = [
+            "epoch",
+            "is_update_epoch",
+            "train_loss",
+            "test_loss",
+            "param_count",
+            "sizes",
+            "pruned",
+            "grown",
+            "total_pruned",
+            "total_grown",
+        ]
+        for idx in range(layer_count):
+            fieldnames.append(f"candidate_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"ema_mean_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"ema_std_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"size_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"pruned_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"grown_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"active_{idx}")
+
         writer = csv.DictWriter(
             f,
-            fieldnames=[
-                "epoch",
-                "is_update_epoch",
-                "train_loss",
-                "test_loss",
-                "param_count",
-                "sizes",
-                "pruned",
-                "grown",
-                "candidate_0",
-                "candidate_1",
-                "candidate_2",
-                "ema_mean_0",
-                "ema_mean_1",
-                "ema_mean_2",
-                "ema_std_0",
-                "ema_std_1",
-                "ema_std_2",
-                "size_0",
-                "size_1",
-                "size_2",
-                "pruned_0",
-                "pruned_1",
-                "pruned_2",
-                "grown_0",
-                "grown_1",
-                "grown_2",
-            ],
+            fieldnames=fieldnames,
         )
         writer.writeheader()
         for row in history:
             sizes = row["sizes"]
             pruned = row["pruned"]
             grown = row["grown"]
+            active_counts = row["active_counts"]
             candidates = row["candidate_counts"]
             ema_means = row["ema_means"]
             ema_stds = row["ema_stds"]
-            writer.writerow(
-                {
-                    "epoch": row["epoch"],
-                    "is_update_epoch": row["is_update_epoch"],
-                    "train_loss": row["train_loss"],
-                    "test_loss": row["test_loss"],
-                    "param_count": row["param_count"],
-                    "sizes": ",".join(str(x) for x in sizes),
-                    "pruned": ",".join(str(x) for x in pruned),
-                    "grown": ",".join(str(x) for x in grown),
-                    "candidate_0": candidates[0],
-                    "candidate_1": candidates[1],
-                    "candidate_2": candidates[2],
-                    "ema_mean_0": ema_means[0],
-                    "ema_mean_1": ema_means[1],
-                    "ema_mean_2": ema_means[2],
-                    "ema_std_0": ema_stds[0],
-                    "ema_std_1": ema_stds[1],
-                    "ema_std_2": ema_stds[2],
-                    "size_0": sizes[0],
-                    "size_1": sizes[1],
-                    "size_2": sizes[2],
-                    "pruned_0": pruned[0],
-                    "pruned_1": pruned[1],
-                    "pruned_2": pruned[2],
-                    "grown_0": grown[0],
-                    "grown_1": grown[1],
-                    "grown_2": grown[2],
-                }
-            )
+            row_dict = {
+                "epoch": row["epoch"],
+                "is_update_epoch": row["is_update_epoch"],
+                "train_loss": row["train_loss"],
+                "test_loss": row["test_loss"],
+                "param_count": row["param_count"],
+                "sizes": ",".join(str(x) for x in sizes),
+                "pruned": ",".join(str(x) for x in pruned),
+                "grown": ",".join(str(x) for x in grown),
+                "total_pruned": row["total_pruned"],
+                "total_grown": row["total_grown"],
+            }
+            for idx in range(layer_count):
+                row_dict[f"candidate_{idx}"] = candidates[idx]
+                row_dict[f"ema_mean_{idx}"] = ema_means[idx]
+                row_dict[f"ema_std_{idx}"] = ema_stds[idx]
+                row_dict[f"size_{idx}"] = sizes[idx]
+                row_dict[f"pruned_{idx}"] = pruned[idx]
+                row_dict[f"grown_{idx}"] = grown[idx]
+                row_dict[f"active_{idx}"] = active_counts[idx]
+            writer.writerow(row_dict)
 
     final_row = history[-1]
     if ema_state is None:
@@ -314,11 +358,16 @@ def train_one_run(
         "n_val": n_val,
         "n_test": n_test,
         "noise": noise,
+        "data_seed": data_seed,
+        "model_seed": model_seed,
+        "shuffle_seed": shuffle_seed,
+        "structure_seed": structure_seed,
         "ema_state": ema_state,
         "ema_beta": ema_beta,
         "ema_z_threshold": ema_z_threshold,
         "max_candidates_per_layer": max_candidates_per_layer,
         "ablation_epsilon_ratio": ablation_epsilon_ratio,
+        "active_threshold": active_threshold,
         "final_epoch": final_row["epoch"],
         "final_train_loss": final_row["train_loss"],
         "final_test_loss": final_row["test_loss"],

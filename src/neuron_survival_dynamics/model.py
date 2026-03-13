@@ -8,7 +8,7 @@ class MLP(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        hidden_sizes: Sequence[int] = (128, 128, 128),
+        hidden_sizes: Sequence[int] = (64, 64),
         output_dim: int = 1,
     ) -> None:
         super().__init__()

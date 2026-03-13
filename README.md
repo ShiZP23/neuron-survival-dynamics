@@ -6,10 +6,13 @@ This project is a small, research-oriented PyTorch experiment that explores whet
 
 The focus is on interpretability, structural evolution, and reproducibility rather than production performance.
 
+The current default model is a `2 -> 64 -> 64 -> 1` ReLU MLP. Structural updates operate on hidden neurons only.
+
 ## Repository structure
 
 - `run.py`: entrypoint script
 - `src/neuron_survival_dynamics/`: package source
+- `scripts/`: standalone visualization / post-processing utilities
 - `requirements.txt`: Python dependencies
 - `results/`: generated experiment outputs (git-ignored)
 
@@ -31,6 +34,20 @@ Inputs are 2D points in `[-1, 1]^2` and the target is a scalar.
 - `prune_only`: remove weak neurons every update interval
 - `prune_grow_random`: prune then add random neurons
 - `prune_grow_split`: prune then split strong neurons
+
+## Turnover-focused analysis
+
+For `prune_grow_random` and `prune_grow_split`, an important analysis target is not only the surviving widths (`size_*`) but also neuron turnover at each structure update:
+
+- how many neurons are pruned per update
+- how many neurons are regrown per update
+- how turnover varies by layer and by seed
+
+## Physical Width vs Functional Activity
+
+- `size_*` tracks physical neuron count (how many units exist in each layer).
+- `active_*` tracks functional participation (how many units have mean absolute activation above a threshold on the validation set).
+- In grow modes, active-neuron dynamics can be more informative than raw width because some newly added units may exist physically but remain weakly active.
 
 ## Conceptual change: fixed fraction → survival-based pruning
 
@@ -60,13 +77,22 @@ New approach (survival-based):
 ## Data splits
 
 - Train: used for parameter updates.
-- Val: used for ablation-based death decisions (to avoid test leakage).
+- Val: used for ablation-based death decisions and active-neuron measurement (to avoid test leakage).
 - Test: used only for evaluation/logging.
+
+## Reproducibility controls
+
+- Dataset generation uses `data_seed`.
+- Model initialization uses `model_seed`.
+- Training batch order uses `shuffle_seed`.
+- Structural prune/grow randomness uses `structure_seed`.
+
+By default these seeds are deterministically derived from `--seed`, but they can also be set independently for controlled ablations.
 
 ## Installation
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -76,27 +102,48 @@ pip install -r requirements.txt
 Single run:
 
 ```bash
-python run.py --task medium --mode prune_grow_split --seed 0
+python3 run.py --task medium --mode prune_grow_split --seed 0
 ```
 
 Run all tasks and modes (also generates a summary plot):
 
 ```bash
-python run.py --all
+python3 run.py --all
 ```
 
 Aggregate existing results manually:
 
 ```bash
-PYTHONPATH=src python -m neuron_survival_dynamics.aggregate --results-dir results
+PYTHONPATH=src python3 -m neuron_survival_dynamics.aggregate --results-dir results
+```
+
+Render a checkpoint as a network diagram:
+
+```bash
+python3 scripts/visualize_network.py results/hard/prune_only/seed_1/<timestamp>/model.pt
+```
+
+Build seed-wise mosaics from the latest run under each `seed_*` directory:
+
+```bash
+python3 scripts/make_seed_comparison_mosaics.py results/hard/prune_grow_split
 ```
 
 ## Key CLI arguments
 
+- `--seed`: base seed (for convenience)
+- `--data-seed`: seed for synthetic dataset generation
+- `--model-seed`: seed for model weight initialization
+- `--shuffle-seed`: seed for train loader shuffling
+- `--structure-seed`: seed for prune/grow structural RNG
+- `--update-interval`: epochs between structural updates (default `50`)
 - `--ema-beta`: EMA decay factor
 - `--ema-z-threshold`: z-score threshold for low-EMA candidates
 - `--max-candidates-per-layer`: max ablation candidates per layer
 - `--ablation-epsilon-ratio`: relative loss tolerance for neuron death
+- `--active-threshold`: threshold used to mark neurons as active
+
+By default, `data_seed/model_seed/shuffle_seed/structure_seed` are deterministically derived from `--seed`, but you can set them explicitly to decouple reproducibility experiments.
 
 ## Outputs
 
@@ -107,8 +154,15 @@ Each run writes to `results/<task>/<mode>/seed_<seed>/<timestamp>/`:
 - `model.pt`: checkpoint dict (`state_dict`, final `hidden_sizes`, EMA state, metadata)
 - `loss.png`: train/test curves
 - `sizes.png`: layer sizes over time
+- `active_neurons.png`: active neuron counts over time
 - `params.png`: parameter count over time
+- `turnover.png`: total and layer-wise neuron turnover over epochs
 - `surface.png`: target vs predicted surface
+
+Additional post-processing can produce:
+
+- `network_diagram.png`: topology visualization rendered from a saved checkpoint
+- `seed_comparison/*.png`: mosaics that compare the latest run for each seed within a task/mode folder
 
 When running `--all`, a summary is also written to:
 
@@ -118,6 +172,8 @@ When running `--all`, a summary is also written to:
 ### Metrics notes
 
 - `is_update_epoch` is `1` only on structure update epochs.
+- `total_pruned` and `total_grown` are explicit per-epoch turnover totals.
+- `candidate_i`, `ema_mean_i`, `ema_std_i`, `size_i`, `pruned_i`, `grown_i`, and `active_i` are created dynamically for each hidden layer `i`.
 - `candidate_*`, `ema_mean_*`, and `ema_std_*` are meaningful only on update epochs.
 - On non-update epochs, those fields are recorded as zeros for simplicity.
 
