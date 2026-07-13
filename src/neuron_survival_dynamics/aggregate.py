@@ -54,10 +54,35 @@ def _read_final_metrics(metrics_path: str) -> Optional[Dict]:
             last_row = row
     if last_row is None:
         return None
+    has_val_loss = "val_loss" in last_row
+    best_row = None
+    if has_val_loss:
+        with open(metrics_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            best_val = float("inf")
+            for row in reader:
+                val_loss = float(row["val_loss"])
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_row = row
     return {
         "epoch": int(last_row["epoch"]),
+        "val_loss": float(last_row["val_loss"]) if has_val_loss else None,
         "test_loss": float(last_row["test_loss"]),
         "param_count": int(float(last_row["param_count"])),
+        "selection_protocol": (
+            "fixed_budget_then_select_best_val_checkpoint"
+            if best_row is not None
+            else "legacy_final_test_only"
+        ),
+        "best_epoch": int(best_row["epoch"]) if best_row is not None else None,
+        "best_val_loss": float(best_row["val_loss"]) if best_row is not None else None,
+        "best_test_loss_at_best_val": (
+            float(best_row["test_loss"]) if best_row is not None else None
+        ),
+        "best_param_count": (
+            int(float(best_row["param_count"])) if best_row is not None else None
+        ),
     }
 
 
@@ -75,6 +100,11 @@ def summarize_results(results_dir: str) -> List[Dict]:
                 "seed": run["seed"],
                 "timestamp": run["timestamp"],
                 "final_epoch": metrics["epoch"],
+                "selection_protocol": metrics["selection_protocol"],
+                "best_epoch": metrics["best_epoch"],
+                "best_val_loss": metrics["best_val_loss"],
+                "test_loss_at_best_val": metrics["best_test_loss_at_best_val"],
+                "best_param_count": metrics["best_param_count"],
                 "final_test_loss": metrics["test_loss"],
                 "final_param_count": metrics["param_count"],
             }
@@ -91,6 +121,11 @@ def write_summary_csv(records: List[Dict], path: str) -> None:
         "seed",
         "timestamp",
         "final_epoch",
+        "selection_protocol",
+        "best_epoch",
+        "best_val_loss",
+        "test_loss_at_best_val",
+        "best_param_count",
         "final_test_loss",
         "final_param_count",
     ]
@@ -127,8 +162,18 @@ def plot_summary(records: List[Dict], path: str) -> None:
             task_subset = [row for row in subset if row["task"] == task]
             if not task_subset:
                 continue
-            x_vals = [row["final_param_count"] for row in task_subset]
-            y_vals = [row["final_test_loss"] for row in task_subset]
+            x_vals = [
+                row["best_param_count"]
+                if row["best_param_count"] is not None
+                else row["final_param_count"]
+                for row in task_subset
+            ]
+            y_vals = [
+                row["test_loss_at_best_val"]
+                if row["test_loss_at_best_val"] is not None
+                else row["final_test_loss"]
+                for row in task_subset
+            ]
             plt.scatter(
                 x_vals,
                 y_vals,
@@ -138,9 +183,9 @@ def plot_summary(records: List[Dict], path: str) -> None:
                 alpha=0.8,
             )
 
-    plt.xlabel("final trainable params")
-    plt.ylabel("final test loss")
-    plt.title("Final params vs final test loss")
+    plt.xlabel("selected trainable params")
+    plt.ylabel("selected test loss")
+    plt.title("Selected params vs selected test loss")
     plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(path)

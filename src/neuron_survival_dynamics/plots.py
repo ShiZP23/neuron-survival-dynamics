@@ -8,17 +8,27 @@ from neuron_survival_dynamics.data import evaluate_target, make_grid
 from neuron_survival_dynamics.model import MLP
 
 
-def plot_losses(history: List[Dict], path: str) -> None:
+def plot_losses(history: List[Dict], path: str, log_scale: bool = False) -> None:
     epochs = [row["epoch"] for row in history]
     train_loss = [row["train_loss"] for row in history]
+    val_loss = [row["val_loss"] for row in history]
     test_loss = [row["test_loss"] for row in history]
+    if log_scale:
+        # Clip to a tiny positive floor so log plots stay valid if a loss underflows to zero.
+        floor = 1e-12
+        train_loss = [max(value, floor) for value in train_loss]
+        val_loss = [max(value, floor) for value in val_loss]
+        test_loss = [max(value, floor) for value in test_loss]
 
     plt.figure(figsize=(6, 4))
     plt.plot(epochs, train_loss, label="train")
+    plt.plot(epochs, val_loss, label="val")
     plt.plot(epochs, test_loss, label="test")
+    if log_scale:
+        plt.yscale("log")
     plt.xlabel("epoch")
-    plt.ylabel("mse")
-    plt.title("Loss over time")
+    plt.ylabel("mse" if not log_scale else "mse (log scale)")
+    plt.title("Loss over time" if not log_scale else "Loss over time (log scale)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(path)

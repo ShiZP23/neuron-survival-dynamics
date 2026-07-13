@@ -9,8 +9,16 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from neuron_survival_dynamics.data import DatasetBundle, make_dataset
 from neuron_survival_dynamics.model import MLP
-from neuron_survival_dynamics.structural import compute_importance, prune_and_grow
+from neuron_survival_dynamics.structural import (
+    compute_importance,
+    compute_importance_components,
+    prune_and_grow,
+)
 from neuron_survival_dynamics.utils import count_trainable_params
+
+
+def _clone_state_dict(model: MLP) -> Dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
 def _run_epoch(
@@ -96,6 +104,116 @@ def _count_active_neurons(
     return [int((m > active_threshold).sum().item()) for m in mean_abs]
 
 
+def _evaluate_prune_screening(
+    model: MLP,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int,
+    baseline_val_loss: float,
+    mean_abs: List[torch.Tensor],
+    outgoing_norms: List[torch.Tensor],
+    importances: List[torch.Tensor],
+    ema_state: Optional[List[torch.Tensor]],
+    ema_beta: float,
+    ema_z_threshold: float,
+    max_candidates_per_layer: int,
+    min_neurons: int,
+    ablation_epsilon_ratio: float,
+) -> Dict[str, object]:
+    layer_count = len(model.hidden_sizes())
+    mean_abs_cpu = [value.detach().cpu() for value in mean_abs]
+    outgoing_norms_cpu = [value.detach().cpu() for value in outgoing_norms]
+    importances_cpu = [value.detach().cpu() for value in importances]
+
+    if ema_state is None:
+        ema_state = [value.clone() for value in importances_cpu]
+    else:
+        for layer_idx, values in enumerate(importances_cpu):
+            ema_state[layer_idx] = ema_beta * ema_state[layer_idx] + (1.0 - ema_beta) * values
+
+    prune_indices: List[List[int]] = [[] for _ in range(layer_count)]
+    candidate_counts = [0 for _ in range(layer_count)]
+    would_prune_counts = [0 for _ in range(layer_count)]
+    ema_means = [0.0 for _ in range(layer_count)]
+    ema_stds = [0.0 for _ in range(layer_count)]
+    thresholds = [0.0 for _ in range(layer_count)]
+    snapshot_rows: List[Dict[str, object]] = []
+
+    epsilon = ablation_epsilon_ratio * max(baseline_val_loss, 1e-12)
+    for layer_idx, ema in enumerate(ema_state):
+        mean = float(ema.mean())
+        std = float(ema.std(unbiased=False)) if ema.numel() > 1 else 0.0
+        threshold = mean - ema_z_threshold * std
+        ema_means[layer_idx] = mean
+        ema_stds[layer_idx] = std
+        thresholds[layer_idx] = threshold
+
+        candidates = (ema < threshold).nonzero(as_tuple=False).flatten().tolist()
+        if candidates:
+            candidates = sorted(candidates, key=lambda neuron_idx: ema[neuron_idx].item())
+            candidates = candidates[:max_candidates_per_layer]
+        candidate_counts[layer_idx] = len(candidates)
+        candidate_rank = {neuron_idx: rank for rank, neuron_idx in enumerate(candidates)}
+
+        max_prune = max(int(ema.numel()) - min_neurons, 0)
+        ablation_by_neuron: Dict[int, float] = {}
+        delta_by_neuron: Dict[int, float] = {}
+        would_prune_set = set()
+        for neuron_idx in candidates:
+            if len(prune_indices[layer_idx]) >= max_prune:
+                break
+            ablated_loss = _ablation_loss(
+                model,
+                val_loader,
+                criterion,
+                device,
+                layer_idx,
+                neuron_idx,
+            )
+            delta = ablated_loss - baseline_val_loss
+            ablation_by_neuron[neuron_idx] = ablated_loss
+            delta_by_neuron[neuron_idx] = delta
+            if delta < epsilon:
+                prune_indices[layer_idx].append(neuron_idx)
+                would_prune_set.add(neuron_idx)
+        would_prune_counts[layer_idx] = len(would_prune_set)
+
+        for neuron_idx in range(int(ema.numel())):
+            snapshot_rows.append(
+                {
+                    "epoch": epoch,
+                    "layer_idx": layer_idx,
+                    "neuron_idx": neuron_idx,
+                    "mean_abs_activation": float(mean_abs_cpu[layer_idx][neuron_idx]),
+                    "outgoing_norm": float(outgoing_norms_cpu[layer_idx][neuron_idx]),
+                    "importance": float(importances_cpu[layer_idx][neuron_idx]),
+                    "ema_importance": float(ema[neuron_idx]),
+                    "ema_mean_layer": mean,
+                    "ema_std_layer": std,
+                    "threshold": threshold,
+                    "baseline_val_loss": baseline_val_loss,
+                    "ablation_epsilon": epsilon,
+                    "is_candidate": int(neuron_idx in candidate_rank),
+                    "candidate_rank": candidate_rank.get(neuron_idx, -1),
+                    "would_prune": int(neuron_idx in would_prune_set),
+                    "ablated_val_loss": ablation_by_neuron.get(neuron_idx),
+                    "delta_val_loss": delta_by_neuron.get(neuron_idx),
+                }
+            )
+
+    return {
+        "ema_state": ema_state,
+        "prune_indices": prune_indices,
+        "candidate_counts": candidate_counts,
+        "would_prune_counts": would_prune_counts,
+        "ema_means": ema_means,
+        "ema_stds": ema_stds,
+        "thresholds": thresholds,
+        "snapshot_rows": snapshot_rows,
+    }
+
+
 def train_one_run(
     task: str,
     mode: str,
@@ -120,6 +238,9 @@ def train_one_run(
     max_candidates_per_layer: int = 8,
     ablation_epsilon_ratio: float = 0.01,
     active_threshold: float = 1e-3,
+    freeze_structure_after_epoch: Optional[int] = None,
+    freeze_structure_reference: Optional[str] = None,
+    shadow_prune: bool = False,
 ) -> Tuple[MLP, List[Dict]]:
     data: DatasetBundle = make_dataset(
         task=task,
@@ -166,11 +287,21 @@ def train_one_run(
     criterion = nn.MSELoss()
     rng = np.random.default_rng(structure_seed)
     ema_state: Optional[List[torch.Tensor]] = None
+    shadow_ema_state: Optional[List[torch.Tensor]] = None
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_test_loss = float("inf")
+    best_train_loss = float("inf")
+    best_param_count = 0
+    best_hidden_sizes: List[int] = []
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
 
     history: List[Dict] = []
+    shadow_snapshot_rows: List[Dict[str, object]] = []
 
     for epoch in range(1, epochs + 1):
         train_loss = _run_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss = _run_epoch(model, val_loader, criterion, None, device)
         test_loss = _run_epoch(model, test_loader, criterion, None, device)
 
         layer_count = len(model.hidden_sizes())
@@ -179,59 +310,53 @@ def train_one_run(
         candidate_counts = [0 for _ in range(layer_count)]
         ema_means = [0.0 for _ in range(layer_count)]
         ema_stds = [0.0 for _ in range(layer_count)]
+        is_shadow_update_epoch = 0
+        shadow_candidate_counts = [0 for _ in range(layer_count)]
+        shadow_would_prune_counts = [0 for _ in range(layer_count)]
+        shadow_ema_means = [0.0 for _ in range(layer_count)]
+        shadow_ema_stds = [0.0 for _ in range(layer_count)]
+        shadow_thresholds = [0.0 for _ in range(layer_count)]
         is_update_epoch = 0
         updated = False
-        if mode != "fixed" and epoch % update_interval == 0:
-            is_update_epoch = 1
-            baseline_val_loss = _run_epoch(
-                model, val_loader, criterion, None, device
+        structure_updates_allowed = (
+            freeze_structure_after_epoch is None or epoch <= freeze_structure_after_epoch
+        )
+        screening_enabled = epoch % update_interval == 0 and structure_updates_allowed
+        actual_structure_update = mode != "fixed" and screening_enabled
+        shadow_structure_update = mode == "fixed" and shadow_prune and screening_enabled
+        if actual_structure_update or shadow_structure_update:
+            mean_abs, outgoing_norms, importances = compute_importance_components(
+                model, importance_loader, device
             )
-            importances = compute_importance(model, importance_loader, device)
-            importances_cpu = [imp.detach().cpu() for imp in importances]
+            baseline_val_loss = val_loss
 
-            if ema_state is None:
-                # Initialize EMA from the first measured importance.
-                ema_state = [imp.clone() for imp in importances_cpu]
-            else:
-                for idx, imp in enumerate(importances_cpu):
-                    ema_state[idx] = ema_beta * ema_state[idx] + (1.0 - ema_beta) * imp
-
-            prune_indices: List[List[int]] = [[] for _ in range(layer_count)]
-            for layer_idx, ema in enumerate(ema_state):
-                mean = float(ema.mean())
-                std = float(ema.std(unbiased=False)) if ema.numel() > 1 else 0.0
-                ema_means[layer_idx] = mean
-                ema_stds[layer_idx] = std
-                threshold = mean - ema_z_threshold * std
-                candidates = (ema < threshold).nonzero(as_tuple=False).flatten().tolist()
-                if candidates:
-                    candidates = sorted(candidates, key=lambda i: ema[i].item())
-                    candidates = candidates[:max_candidates_per_layer]
-                candidate_counts[layer_idx] = len(candidates)
-
-                max_prune = max(int(ema.numel()) - min_neurons, 0)
-                if max_prune == 0:
-                    continue
-
-                epsilon = ablation_epsilon_ratio * max(baseline_val_loss, 1e-12)
-                for neuron_idx in candidates:
-                    if len(prune_indices[layer_idx]) >= max_prune:
-                        break
-                    ablated_loss = _ablation_loss(
-                        model,
-                        val_loader,
-                        criterion,
-                        device,
-                        layer_idx,
-                        neuron_idx,
-                    )
-                    delta = ablated_loss - baseline_val_loss
-                    if delta < epsilon:
-                        prune_indices[layer_idx].append(neuron_idx)
+        if actual_structure_update:
+            is_update_epoch = 1
+            screening = _evaluate_prune_screening(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                epoch=epoch,
+                baseline_val_loss=baseline_val_loss,
+                mean_abs=mean_abs,
+                outgoing_norms=outgoing_norms,
+                importances=importances,
+                ema_state=ema_state,
+                ema_beta=ema_beta,
+                ema_z_threshold=ema_z_threshold,
+                max_candidates_per_layer=max_candidates_per_layer,
+                min_neurons=min_neurons,
+                ablation_epsilon_ratio=ablation_epsilon_ratio,
+            )
+            ema_state = screening["ema_state"]
+            candidate_counts = screening["candidate_counts"]
+            ema_means = screening["ema_means"]
+            ema_stds = screening["ema_stds"]
 
             pruned, grown, ema_state = prune_and_grow(
                 model,
-                prune_indices,
+                screening["prune_indices"],
                 mode=mode,
                 importances=importances,
                 rng=rng,
@@ -239,11 +364,38 @@ def train_one_run(
             )
             changed = any(p > 0 for p in pruned) or any(g > 0 for g in grown)
             if changed:
-                # Optimizer state is reset because parameter shapes changed.
                 optimizer = torch.optim.Adam(model.parameters(), lr=lr)
                 updated = True
 
+        if shadow_structure_update:
+            is_shadow_update_epoch = 1
+            shadow_screening = _evaluate_prune_screening(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                epoch=epoch,
+                baseline_val_loss=baseline_val_loss,
+                mean_abs=mean_abs,
+                outgoing_norms=outgoing_norms,
+                importances=importances,
+                ema_state=shadow_ema_state,
+                ema_beta=ema_beta,
+                ema_z_threshold=ema_z_threshold,
+                max_candidates_per_layer=max_candidates_per_layer,
+                min_neurons=min_neurons,
+                ablation_epsilon_ratio=ablation_epsilon_ratio,
+            )
+            shadow_ema_state = shadow_screening["ema_state"]
+            shadow_candidate_counts = shadow_screening["candidate_counts"]
+            shadow_would_prune_counts = shadow_screening["would_prune_counts"]
+            shadow_ema_means = shadow_screening["ema_means"]
+            shadow_ema_stds = shadow_screening["ema_stds"]
+            shadow_thresholds = shadow_screening["thresholds"]
+            shadow_snapshot_rows.extend(shadow_screening["snapshot_rows"])
+
         if updated:
+            val_loss = _run_epoch(model, val_loader, criterion, None, device)
             test_loss = _run_epoch(model, test_loader, criterion, None, device)
 
         sizes = model.hidden_sizes()
@@ -254,12 +406,21 @@ def train_one_run(
             device=device,
             active_threshold=active_threshold,
         )
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_test_loss = test_loss
+            best_train_loss = train_loss
+            best_param_count = param_count
+            best_hidden_sizes = list(sizes)
+            best_state_dict = _clone_state_dict(model)
         total_pruned = sum(pruned)
         total_grown = sum(grown)
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "val_loss": val_loss,
                 "test_loss": test_loss,
                 "param_count": param_count,
                 "sizes": sizes,
@@ -272,6 +433,12 @@ def train_one_run(
                 "ema_means": ema_means,
                 "ema_stds": ema_stds,
                 "is_update_epoch": is_update_epoch,
+                "is_shadow_update_epoch": is_shadow_update_epoch,
+                "shadow_candidate_counts": shadow_candidate_counts,
+                "shadow_would_prune_counts": shadow_would_prune_counts,
+                "shadow_ema_means": shadow_ema_means,
+                "shadow_ema_stds": shadow_ema_stds,
+                "shadow_thresholds": shadow_thresholds,
             }
         )
 
@@ -281,7 +448,9 @@ def train_one_run(
         fieldnames = [
             "epoch",
             "is_update_epoch",
+            "is_shadow_update_epoch",
             "train_loss",
+            "val_loss",
             "test_loss",
             "param_count",
             "sizes",
@@ -304,6 +473,16 @@ def train_one_run(
             fieldnames.append(f"grown_{idx}")
         for idx in range(layer_count):
             fieldnames.append(f"active_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"shadow_candidate_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"shadow_would_prune_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"shadow_ema_mean_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"shadow_ema_std_{idx}")
+        for idx in range(layer_count):
+            fieldnames.append(f"shadow_threshold_{idx}")
 
         writer = csv.DictWriter(
             f,
@@ -318,10 +497,17 @@ def train_one_run(
             candidates = row["candidate_counts"]
             ema_means = row["ema_means"]
             ema_stds = row["ema_stds"]
+            shadow_candidates = row["shadow_candidate_counts"]
+            shadow_would_prune = row["shadow_would_prune_counts"]
+            shadow_ema_means = row["shadow_ema_means"]
+            shadow_ema_stds = row["shadow_ema_stds"]
+            shadow_thresholds = row["shadow_thresholds"]
             row_dict = {
                 "epoch": row["epoch"],
                 "is_update_epoch": row["is_update_epoch"],
+                "is_shadow_update_epoch": row["is_shadow_update_epoch"],
                 "train_loss": row["train_loss"],
+                "val_loss": row["val_loss"],
                 "test_loss": row["test_loss"],
                 "param_count": row["param_count"],
                 "sizes": ",".join(str(x) for x in sizes),
@@ -338,12 +524,27 @@ def train_one_run(
                 row_dict[f"pruned_{idx}"] = pruned[idx]
                 row_dict[f"grown_{idx}"] = grown[idx]
                 row_dict[f"active_{idx}"] = active_counts[idx]
+                row_dict[f"shadow_candidate_{idx}"] = shadow_candidates[idx]
+                row_dict[f"shadow_would_prune_{idx}"] = shadow_would_prune[idx]
+                row_dict[f"shadow_ema_mean_{idx}"] = shadow_ema_means[idx]
+                row_dict[f"shadow_ema_std_{idx}"] = shadow_ema_stds[idx]
+                row_dict[f"shadow_threshold_{idx}"] = shadow_thresholds[idx]
             writer.writerow(row_dict)
+
+    if shadow_snapshot_rows:
+        shadow_path = os.path.join(run_dir, "shadow_prune_snapshots.csv")
+        with open(shadow_path, "w", newline="") as f:
+            fieldnames = list(shadow_snapshot_rows[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(shadow_snapshot_rows)
 
     final_row = history[-1]
     if ema_state is None:
         ema_state = [torch.zeros(size) for size in model.hidden_sizes()]
-    checkpoint = {
+    if shadow_ema_state is None:
+        shadow_ema_state = [torch.zeros(size) for size in model.hidden_sizes()]
+    final_checkpoint = {
         "state_dict": model.state_dict(),
         "hidden_sizes": model.hidden_sizes(),
         "task": task,
@@ -368,10 +569,58 @@ def train_one_run(
         "max_candidates_per_layer": max_candidates_per_layer,
         "ablation_epsilon_ratio": ablation_epsilon_ratio,
         "active_threshold": active_threshold,
+        "freeze_structure_after_epoch": freeze_structure_after_epoch,
+        "freeze_structure_reference": freeze_structure_reference,
+        "shadow_prune": shadow_prune,
+        "shadow_ema_state": shadow_ema_state,
         "final_epoch": final_row["epoch"],
         "final_train_loss": final_row["train_loss"],
+        "final_val_loss": final_row["val_loss"],
         "final_test_loss": final_row["test_loss"],
         "final_param_count": final_row["param_count"],
+        "selection_protocol": "fixed_budget_then_select_best_val_checkpoint",
+        "best_epoch": best_epoch,
+        "best_train_loss": best_train_loss,
+        "best_val_loss": best_val_loss,
+        "best_test_loss_at_best_val": best_test_loss,
+        "best_param_count": best_param_count,
+        "best_hidden_sizes": best_hidden_sizes,
     }
-    torch.save(checkpoint, os.path.join(run_dir, "model.pt"))
+    torch.save(final_checkpoint, os.path.join(run_dir, "model.pt"))
+    if best_state_dict is not None:
+        best_checkpoint = {
+            "state_dict": best_state_dict,
+            "hidden_sizes": best_hidden_sizes,
+            "task": task,
+            "mode": mode,
+            "seed": seed,
+            "epochs": epochs,
+            "update_interval": update_interval,
+            "batch_size": batch_size,
+            "lr": lr,
+            "min_neurons": min_neurons,
+            "n_train": n_train,
+            "n_val": n_val,
+            "n_test": n_test,
+            "noise": noise,
+            "data_seed": data_seed,
+            "model_seed": model_seed,
+            "shuffle_seed": shuffle_seed,
+            "structure_seed": structure_seed,
+            "ema_beta": ema_beta,
+            "ema_z_threshold": ema_z_threshold,
+            "max_candidates_per_layer": max_candidates_per_layer,
+            "ablation_epsilon_ratio": ablation_epsilon_ratio,
+            "active_threshold": active_threshold,
+            "freeze_structure_after_epoch": freeze_structure_after_epoch,
+            "freeze_structure_reference": freeze_structure_reference,
+            "shadow_prune": shadow_prune,
+            "selection_protocol": "validation_loss_minimization",
+            "best_epoch": best_epoch,
+            "best_train_loss": best_train_loss,
+            "best_val_loss": best_val_loss,
+            "best_test_loss_at_best_val": best_test_loss,
+            "best_param_count": best_param_count,
+        }
+        torch.save(best_checkpoint, os.path.join(run_dir, "best_model.pt"))
     return model, history

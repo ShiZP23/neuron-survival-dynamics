@@ -1,5 +1,7 @@
 # Neuron Survival Dynamics: Survival-Based Prune + Regrow
 
+中文研究全景、阶段演进和主要结论见 [`docs/research_summary_zh.md`](docs/research_summary_zh.md)。
+
 ## Project overview
 
 This project is a small, research-oriented PyTorch experiment that explores whether a dense MLP can self-organize into a more efficient architecture when we periodically prune weak neurons and regrow new ones during training.
@@ -153,6 +155,7 @@ Each run writes to `results/<task>/<mode>/seed_<seed>/<timestamp>/`:
 - `metrics.csv`: per-epoch losses, parameter counts, and layer stats
 - `model.pt`: checkpoint dict (`state_dict`, final `hidden_sizes`, EMA state, metadata)
 - `loss.png`: train/test curves
+- `loss_log.png`: train/val/test curves on a log-scaled y-axis
 - `sizes.png`: layer sizes over time
 - `active_neurons.png`: active neuron counts over time
 - `params.png`: parameter count over time
