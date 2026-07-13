@@ -47,3 +47,6 @@ temp/
 results/
 former results/
 research/
+
+# Local curated-result symlinks; publish manifests, not machine-specific links
+curated_results/**/seed_*
