@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structure-seed", type=int, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument(
+        "--shadow-prune",
+        action="store_true",
+        help="In fixed mode, evaluate prune_only screening at update epochs and log would-be-pruned neurons without changing structure.",
+    )
     parser.add_argument("--all", action="store_true", help="run all tasks and modes")
     return parser.parse_args()
 
@@ -78,6 +83,7 @@ def run_single(args: argparse.Namespace, task: str, mode: str, seed: int) -> Non
         "shuffle_seed": shuffle_seed,
         "structure_seed": structure_seed,
         "device": str(device),
+        "shadow_prune": args.shadow_prune,
     }
     save_json(os.path.join(run_dir, "config.json"), config)
 
@@ -105,9 +111,11 @@ def run_single(args: argparse.Namespace, task: str, mode: str, seed: int) -> Non
         max_candidates_per_layer=args.max_candidates_per_layer,
         ablation_epsilon_ratio=args.ablation_epsilon_ratio,
         active_threshold=args.active_threshold,
+        shadow_prune=args.shadow_prune,
     )
 
     plot_losses(history, os.path.join(run_dir, "loss.png"))
+    plot_losses(history, os.path.join(run_dir, "loss_log.png"), log_scale=True)
     plot_sizes(history, os.path.join(run_dir, "sizes.png"))
     plot_active_neurons(history, os.path.join(run_dir, "active_neurons.png"))
     plot_param_count(history, os.path.join(run_dir, "params.png"))

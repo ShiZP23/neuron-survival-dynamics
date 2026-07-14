@@ -8,9 +8,9 @@ from torch import nn
 from neuron_survival_dynamics.model import MLP
 
 
-def compute_importance(
+def compute_importance_components(
     model: MLP, data_loader: torch.utils.data.DataLoader, device: torch.device
-) -> List[torch.Tensor]:
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
     model.eval()
     sizes = model.hidden_sizes()
     sums = [torch.zeros(size, device=device) for size in sizes]
@@ -35,6 +35,13 @@ def compute_importance(
         outgoing_norms.append(next_weight.norm(dim=0))
 
     importances = [mean_abs[i] * outgoing_norms[i] for i in range(len(sizes))]
+    return mean_abs, outgoing_norms, importances
+
+
+def compute_importance(
+    model: MLP, data_loader: torch.utils.data.DataLoader, device: torch.device
+) -> List[torch.Tensor]:
+    _, _, importances = compute_importance_components(model, data_loader, device)
     return importances
 
 
